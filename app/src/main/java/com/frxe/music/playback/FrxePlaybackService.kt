@@ -8,6 +8,7 @@ import android.os.Looper
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -15,8 +16,12 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.session.LibraryResult
+import androidx.media3.session.MediaLibraryService
+import androidx.media3.session.MediaLibraryService.LibraryParams
+import androidx.media3.session.MediaLibraryService.MediaLibrarySession
 import androidx.media3.session.MediaSession
-import androidx.media3.session.MediaSessionService
+import androidx.media3.session.SessionError
 import com.frxe.music.MainActivity
 import com.frxe.music.data.FrxeDatabase
 import com.frxe.music.data.PlaybackHistoryEntity
@@ -26,6 +31,7 @@ import com.frxe.music.island.IslandHubPreferences
 import com.frxe.music.model.Track
 import com.frxe.music.source.PlaybackResolutionMonitor
 import com.frxe.music.source.PlaybackStreamResolver
+import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.SettableFuture
 import kotlinx.coroutines.CoroutineScope
@@ -38,11 +44,12 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
 @OptIn(UnstableApi::class)
-class FrxePlaybackService : MediaSessionService() {
-    private var mediaSession: MediaSession? = null
+class FrxePlaybackService : MediaLibraryService() {
+    private var mediaSession: MediaLibrarySession? = null
     private lateinit var player: ExoPlayer
     private lateinit var systemMediaPlayer: FrxeSystemMediaPlayer
     private lateinit var playbackStore: PlaybackStateStore
+    private lateinit var androidAutoLibrary: AndroidAutoLibrary
     private var islandOverlay: IslandHubOverlayController? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val serviceScope =
@@ -111,6 +118,32 @@ class FrxePlaybackService : MediaSessionService() {
             islandOverlay?.refresh()
         }
 
+        override fun onMediaItemTransition(
+            mediaItem: MediaItem?,
+            reason: Int
+        ) {
+            val track = mediaItem
+                ?.takeIf { ::playbackStore.isInitialized }
+                ?.let(playbackStore::trackFromMediaItem)
+                ?: return
+
+            val currentQueueTrackId =
+                PlaybackQueueStore.state.value.current?.trackId
+
+            if (
+                ExternalPlaybackSelectionPolicy.shouldMirror(
+                    currentQueueTrackId = currentQueueTrackId,
+                    selectedMediaId = track.id
+                )
+            ) {
+                val mirroredState = PlaybackQueueStore.replace(
+                    tracks = listOf(track),
+                    currentTrackId = track.id
+                )
+                loadedQueueEntryId = mirroredState.current?.entryId
+            }
+        }
+
         override fun onPlaybackStateChanged(
             playbackState: Int
         ) {
@@ -145,7 +178,7 @@ class FrxePlaybackService : MediaSessionService() {
         }
     }
 
-    private val sessionCallback = object : MediaSession.Callback {
+    private val sessionCallback = object : MediaLibrarySession.Callback {
         override fun onPlaybackResumption(
             mediaSession: MediaSession,
             controller: MediaSession.ControllerInfo,
@@ -197,6 +230,173 @@ class FrxePlaybackService : MediaSessionService() {
 
             return future
         }
+
+        override fun onGetLibraryRoot(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            params: LibraryParams?
+        ): ListenableFuture<LibraryResult<MediaItem>> =
+            SettableFuture.create<LibraryResult<MediaItem>>().also { future ->
+                future.set(
+                    LibraryResult.ofItem(
+                        androidAutoLibrary.rootItem(),
+                        params
+                    )
+                )
+            }
+
+        override fun onGetChildren(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            parentId: String,
+            page: Int,
+            pageSize: Int,
+            params: LibraryParams?
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
+            val future =
+                SettableFuture.create<LibraryResult<ImmutableList<MediaItem>>>()
+
+            serviceScope.launch {
+                try {
+                    if (AndroidAutoBrowsePolicy.parse(parentId) == null) {
+                        future.set(
+                            LibraryResult.ofError(
+                                SessionError.ERROR_BAD_VALUE
+                            )
+                        )
+                        return@launch
+                    }
+
+                    val children = androidAutoLibrary.children(parentId)
+                    future.set(
+                        LibraryResult.ofItemList(
+                            pageItems(children, page, pageSize),
+                            params
+                        )
+                    )
+                } catch (error: Throwable) {
+                    future.setException(error)
+                }
+            }
+
+            return future
+        }
+
+        override fun onGetItem(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            mediaId: String
+        ): ListenableFuture<LibraryResult<MediaItem>> {
+            val future =
+                SettableFuture.create<LibraryResult<MediaItem>>()
+
+            serviceScope.launch {
+                try {
+                    val item = androidAutoLibrary.item(mediaId)
+                    future.set(
+                        if (item != null) {
+                            LibraryResult.ofItem(item, null)
+                        } else {
+                            LibraryResult.ofError(
+                                SessionError.ERROR_BAD_VALUE
+                            )
+                        }
+                    )
+                } catch (error: Throwable) {
+                    future.setException(error)
+                }
+            }
+
+            return future
+        }
+
+        override fun onSearch(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            query: String,
+            params: LibraryParams?
+        ): ListenableFuture<LibraryResult<Void>> {
+            val future =
+                SettableFuture.create<LibraryResult<Void>>()
+
+            serviceScope.launch {
+                try {
+                    val results = androidAutoLibrary.search(query)
+                    session.notifySearchResultChanged(
+                        browser,
+                        query,
+                        results.size,
+                        params
+                    )
+                    future.set(LibraryResult.ofVoid(params))
+                } catch (error: Throwable) {
+                    future.setException(error)
+                }
+            }
+
+            return future
+        }
+
+        override fun onGetSearchResult(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            query: String,
+            page: Int,
+            pageSize: Int,
+            params: LibraryParams?
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
+            val future =
+                SettableFuture.create<LibraryResult<ImmutableList<MediaItem>>>()
+
+            serviceScope.launch {
+                try {
+                    val results = androidAutoLibrary.search(query)
+                    future.set(
+                        LibraryResult.ofItemList(
+                            pageItems(results, page, pageSize),
+                            params
+                        )
+                    )
+                } catch (error: Throwable) {
+                    future.setException(error)
+                }
+            }
+
+            return future
+        }
+
+        override fun onAddMediaItems(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            mediaItems: List<MediaItem>
+        ): ListenableFuture<List<MediaItem>> {
+            val future = SettableFuture.create<List<MediaItem>>()
+
+            serviceScope.launch {
+                try {
+                    val resolvedItems = mediaItems.map { requestedItem ->
+                        val track = androidAutoLibrary.track(
+                            requestedItem.mediaId
+                        ) ?: throw IllegalArgumentException(
+                            "Unknown FRXE media ID: ${requestedItem.mediaId}"
+                        )
+
+                        val resolvedTrack = playbackResolver.resolve(track)
+                            ?: throw IllegalStateException(
+                                "FRXE could not resolve ${track.id} for playback."
+                            )
+
+                        resolvedTrack.toMediaItem()
+                    }
+
+                    future.set(resolvedItems)
+                } catch (error: Throwable) {
+                    future.setException(error)
+                }
+            }
+
+            return future
+        }
     }
 
     override fun onCreate() {
@@ -205,6 +405,7 @@ class FrxePlaybackService : MediaSessionService() {
         DownloadSupport.initialize(this)
         PlaybackQueueStore.initialize(this)
         playbackStore = PlaybackStateStore(this)
+        androidAutoLibrary = AndroidAutoLibrary(this)
 
         val savedSnapshot = playbackStore.restore()
 
@@ -276,12 +477,12 @@ class FrxePlaybackService : MediaSessionService() {
                 PendingIntent.FLAG_IMMUTABLE
         )
 
-        mediaSession = MediaSession.Builder(
+        mediaSession = MediaLibrarySession.Builder(
             this,
-            systemMediaPlayer
+            systemMediaPlayer,
+            sessionCallback
         )
             .setSessionActivity(sessionActivity)
-            .setCallback(sessionCallback)
             .build()
 
         savedSnapshot?.let(::applyPlaybackPreferences)
@@ -320,7 +521,7 @@ class FrxePlaybackService : MediaSessionService() {
 
     override fun onGetSession(
         controllerInfo: MediaSession.ControllerInfo
-    ): MediaSession? = mediaSession
+    ): MediaLibrarySession? = mediaSession
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
@@ -490,6 +691,25 @@ class FrxePlaybackService : MediaSessionService() {
                 PlaybackQueueStore.consumePlayRequest(expectedEntryId)
             }
         }
+    }
+
+    private fun pageItems(
+        items: List<MediaItem>,
+        page: Int,
+        pageSize: Int
+    ): List<MediaItem> {
+        if (page < 0 || pageSize <= 0 || items.isEmpty()) {
+            return emptyList()
+        }
+
+        val start = (page.toLong() * pageSize.toLong())
+            .coerceAtMost(items.size.toLong())
+            .toInt()
+        val end = (start.toLong() + pageSize.toLong())
+            .coerceAtMost(items.size.toLong())
+            .toInt()
+
+        return items.subList(start, end)
     }
 
     private fun recordReadyQueueHistory() {
